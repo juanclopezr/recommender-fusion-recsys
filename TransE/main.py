@@ -17,11 +17,11 @@ flags.DEFINE_float("lr", default=0.01, help="Learning rate value.")
 flags.DEFINE_integer("seed", default=1234, help="Seed value.")
 flags.DEFINE_integer("batch_size", default=16384, help="Maximum batch size.")
 flags.DEFINE_integer("validation_batch_size", default=64, help="Maximum batch size during model validation.")
-flags.DEFINE_integer("vector_length", default=16, help="Length of entity/relation vector.")
+flags.DEFINE_integer("vector_length", default=128, help="Length of entity/relation vector.")
 flags.DEFINE_float("margin", default=1.0, help="Margin value in margin-based ranking loss.")
 flags.DEFINE_integer("norm", default=1, help="Norm used for calculating dissimilarity metric (usually 1 or 2).")
 flags.DEFINE_integer("epochs", default=100, help="Number of training epochs.")
-flags.DEFINE_string("dataset_path", default="../datasets/MOOCCubeX", help="Path to dataset.")
+flags.DEFINE_string("dataset_path", default="../../datasets/GCF", help="Path to dataset.")
 flags.DEFINE_bool("use_gpu", default=True, help="Flag enabling gpu usage.")
 flags.DEFINE_integer("validation_freq", default=300, help="Validate model every X epochs.")
 flags.DEFINE_string("checkpoint_path", default="", help="Path to model checkpoint (by default train from scratch).")
@@ -89,8 +89,8 @@ def main(_):
     torch.backends.cudnn.benchmark = False
 
     path = FLAGS.dataset_path
-    train_path = os.path.join(path, "edges.npy")
-    validation_path = os.path.join(path, "edges.npy")
+    train_path = os.path.join(path, "edges_gcf.npy")
+    validation_path = os.path.join(path, "edges_gcf.npy")
 
     batch_size = FLAGS.batch_size
     vector_length = FLAGS.vector_length
@@ -98,16 +98,17 @@ def main(_):
     norm = FLAGS.norm
     learning_rate = FLAGS.lr
     epochs = FLAGS.epochs
-    device = torch.device('cuda:3') if FLAGS.use_gpu else torch.device('cpu')
+    device = torch.device('cuda:2') if FLAGS.use_gpu else torch.device('cpu')
 
     train_set = data.Dataset(train_path)
     train_generator = torch_data.DataLoader(train_set, batch_size=batch_size)
     validation_set = data.Dataset(validation_path)
     validation_generator = torch_data.DataLoader(validation_set, batch_size=FLAGS.validation_batch_size)
 
-    model = model_definition.TransE(entity_count=train_set.__total_entities__(), relation_count=1, dim=vector_length,
+    model = model_definition.TransE(entity_count=train_set.__total_entities__(), relation_count=train_set.__total_relations__(), dim=vector_length,
                                     margin=margin,
                                     device=device, norm=norm)  # type: torch.nn.Module
+    print(train_set.__total_relations__(), train_set.__total_entities__())
     model = model.to(device)
     optimizer = optim.SGD(model.parameters(), lr=learning_rate)
 
@@ -176,11 +177,19 @@ def main(_):
     # Testing the best checkpoint on test dataset
     #storage.load_checkpoint("checkpoint.tar", model, optimizer)
     
+    #numpy_embeddings_re = model.entities_emb.weight.data.cpu().numpy()
+    #numpy_embeddings_im = model.entities_emb_im.weight.data.cpu().numpy()
+    #numpy_embeddings = np.concatenate((numpy_embeddings_re, numpy_embeddings_im), axis=1)
+    
     numpy_embeddings = model.entities_emb.weight.data.cpu().numpy()
+    relation_embeddings = model.relations_emb.weight.data.cpu().numpy()
     print(numpy_embeddings[:10,:])
     
-    with open('embeddings_16.npy', 'wb') as f:
+    with open(f'node_embeddings_gcf_{vector_length}_transe.npy', 'wb') as f:
         np.save(f, numpy_embeddings)
+        
+    with open(f'relation_embeddings_gcf_{vector_length}_transe.npy', 'wb') as f:
+        np.save(f, relation_embeddings)
     #best_model = model.to(device)
     #best_model.eval()
     #scores = test(model=best_model, data_generator=test_generator, entities_count=1, device=device,
