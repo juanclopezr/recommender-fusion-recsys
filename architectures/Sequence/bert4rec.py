@@ -311,10 +311,3 @@ def generate_recommendations_test_dataset(model, encoded_train_sequences, encode
     print(f"Evaluated {num_evaluated_users} users.")
 
     return courses_recommended_list, courses_test_dataset
-
-# Example usage (to be used in notebook or script):
-# df_train, df_test = load_data('dataTrain.csv', 'dataTest.csv')
-# train_sequences = preprocess_data(df_train)
-# test_sequences = preprocess_data(df_test)
-# encoded_train_sequences, encoded_test_sequences, course_encoder = encode_courses(train_sequences, test_sequences)
-# ...
