@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import torch.optim as optim
 
 
 class MultimodalModel(nn.Module):
@@ -11,20 +12,18 @@ class MultimodalModel(nn.Module):
     and training with binary classification or BPR approach.
     """
     def __init__(self, modality_dims, shared_dim=128, fusion_method='concat', 
-                 use_bpr=False, dropout_rate=0.2):
+                 use_bpr=False, dropout_rate=0.2, layers_per_modality=2, autoencoders=None):
         """
         Args:
-            modality_dims (dict): Dictionary mapping modality names to their embedding dimensions
-                Example: {
-                    'text': 768,           # BERT embeddings
-                    'scibert': 768,        # SciBERT embeddings  
-                    'numerical': 50,       # Other features
-                    'graph': 128           # Graph embeddings
-                }
+            modality_dims (dict): Dictionary mapping the respective 3 vectors (user, course_positive,
+            course_negative) with the dimension
+            Example: {'user': 128, 'course_positive': 128, 'course_negative': 128}
             shared_dim (int): Dimension of shared representation space
-            fusion_method (str): Method for fusing modalities ('concat', 'sum', 'attention', 'mlp')
-            use_bpr (bool): Whether to use BPR (Bayesian Personalized Ranking) approach
+            fusion_method (str): Method for fusing modalities ('concat', 'by_autoencoder'.)
+            use_bpr (bool): Whether to use BPR (Bayesian Personalized Ranking) approach, False for binary classification
             dropout_rate (float): Dropout rate for regularization
+            layers_per_modality (int): Number of dense layers per modality 
+            autoencoders (dict or list): Dictionary or list mapping modality names ('user', 'course_positive', 'course_negative') to autoencoder models. Only used if fusion_method == 'by_autoencoder'.
         """
         super(MultimodalModel, self).__init__()
         self.modality_dims = modality_dims
@@ -32,222 +31,180 @@ class MultimodalModel(nn.Module):
         self.fusion_method = fusion_method
         self.use_bpr = use_bpr
         self.dropout_rate = dropout_rate
-        self.modalities = list(modality_dims.keys())
-        
-        # Projection layers for each modality to shared space
-        self.user_projectors = nn.ModuleDict()
-        self.course_projectors = nn.ModuleDict()
-        
-        for modality, input_dim in modality_dims.items():
-            # Project pre-computed embeddings to shared space
-            self.user_projectors[modality] = nn.Sequential(
-                nn.Linear(input_dim, shared_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(shared_dim, shared_dim)
-            )
-            self.course_projectors[modality] = nn.Sequential(
-                nn.Linear(input_dim, shared_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(shared_dim, shared_dim)
-            )
-        
-        # Fusion mechanism
-        if fusion_method == 'attention':
-            self.user_attention = nn.Parameter(torch.ones(len(self.modalities)))
-            self.course_attention = nn.Parameter(torch.ones(len(self.modalities)))
-        elif fusion_method == 'mlp':
-            fused_dim = shared_dim * len(self.modalities)
-            self.user_fusion_mlp = nn.Sequential(
-                nn.Linear(fused_dim, shared_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(shared_dim, shared_dim)
-            )
-            self.course_fusion_mlp = nn.Sequential(
-                nn.Linear(fused_dim, shared_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(shared_dim, shared_dim)
-            )
-        
-        # Final prediction layers
-        final_input_dim = shared_dim * 2  # User + Course representations
-        
+        self.user_vec_dim = modality_dims['user']
+        self.course_pos_vec_dim = modality_dims['course_positive']
+        # Negative course vector dimension in the case of BPR, otherwise not included
         if use_bpr:
-            # For BPR: output raw scores (no sigmoid)
-            self.prediction_layer = nn.Sequential(
-                nn.Linear(final_input_dim, shared_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(shared_dim, shared_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(shared_dim // 2, 1)
-            )
+            self.course_neg_vec_dim = modality_dims['course_negative']
         else:
-            # For binary classification: output probabilities
-            self.prediction_layer = nn.Sequential(
-                nn.Linear(final_input_dim, shared_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(shared_dim, shared_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(shared_dim // 2, 1),
-                nn.Sigmoid()
+            self.course_neg_vec_dim = 0
+
+        # Store autoencoders for each modality (if provided)
+        self.autoencoders = autoencoders if autoencoders is not None else {}
+
+        # Define feature layers for user and course modalities
+        self.user_feature_layer = self._feature_layer(
+            input_dim=self.user_vec_dim,
+            output_dim=self.shared_dim,
+            number_of_layers=layers_per_modality,
+            activation=nn.ReLU(),
+            dropout_rate=dropout_rate,
+            reduction_factor=2
+        )
+
+        self.course_feature_layer = self._feature_layer(
+            input_dim=self.course_pos_vec_dim,
+            output_dim=self.shared_dim,
+            number_of_layers=layers_per_modality,
+            activation=nn.ReLU(),
+            dropout_rate=dropout_rate,
+            reduction_factor=2
+        )
+
+        if self.use_bpr:
+            self.course_neg_feature_layer = self._feature_layer(
+                input_dim=self.course_neg_vec_dim,
+                output_dim=self.shared_dim,
+                number_of_layers=layers_per_modality,
+                activation=nn.ReLU(),
+                dropout_rate=dropout_rate,
+                reduction_factor=2
             )
-        
-        self._init_weights()
-    
-    def _init_weights(self):
-        """Initialize network weights"""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, std=0.01)
-    
-    def encode_user_modality(self, user_embeddings, modality):
+
+        # Fusion layer for combined user and course features for binary classification
+        self.fusion_layer_binary = self._feature_layer(
+            input_dim=self.shared_dim * 2,
+            output_dim=1, # Binary classification output
+            number_of_layers=self.layers_per_modality,
+            activation=nn.ReLU(),
+            dropout_rate=self.dropout_rate,
+            reduction_factor=2
+        )
+
+    def _apply_autoencoder(self, x, modality):
         """
-        Project pre-computed user embeddings for a specific modality to shared space
-        
-        Args:
-            user_embeddings (torch.Tensor): Pre-computed embeddings [batch_size, modality_dim]
-            modality (str): Name of the modality
-        
-        Returns:
-            torch.Tensor: Projected embeddings in shared space
+        Apply the encoder part of the autoencoder to the input x for the given modality.
         """
-        if modality not in self.modalities:
-            raise ValueError(f"Unknown modality: {modality}")
-        
-        # Project to shared space
-        projected = self.user_projectors[modality](user_embeddings)
-        return projected
+        if self.fusion_method == 'by_autoencoder' and modality in self.autoencoders:
+            return self.autoencoders[modality].encode(x)
+        return x
     
-    def encode_course_modality(self, course_embeddings, modality):
-        """
-        Project pre-computed course embeddings for a specific modality to shared space
-        
-        Args:
-            course_embeddings (torch.Tensor): Pre-computed embeddings [batch_size, modality_dim]
-            modality (str): Name of the modality
-        
-        Returns:
-            torch.Tensor: Projected embeddings in shared space
-        """
-        if modality not in self.modalities:
-            raise ValueError(f"Unknown modality: {modality}")
-        
-        # Project to shared space
-        projected = self.course_projectors[modality](course_embeddings)
-        return projected
-    
-    def fuse_modalities(self, modal_representations, entity_type='user'):
-        """Fuse multiple modal representations"""
-        if self.fusion_method == 'concat':
-            return torch.cat(list(modal_representations.values()), dim=-1)
-        elif self.fusion_method == 'sum':
-            return sum(modal_representations.values())
-        elif self.fusion_method == 'attention':
-            # Use attention weights
-            attention_weights = self.user_attention if entity_type == 'user' else self.course_attention
-            attention_weights = F.softmax(attention_weights, dim=0)
-            
-            weighted_sum = torch.zeros_like(list(modal_representations.values())[0])
-            for i, (modality, representation) in enumerate(modal_representations.items()):
-                weighted_sum += attention_weights[i] * representation
-            
-            return weighted_sum
-        elif self.fusion_method == 'mlp':
-            # Concatenate and pass through MLP
-            concatenated = torch.cat(list(modal_representations.values()), dim=-1)
-            fusion_mlp = self.user_fusion_mlp if entity_type == 'user' else self.course_fusion_mlp
-            return fusion_mlp(concatenated)
+    def forward(self, user, course_positive, course_negative=None):
+        # Apply autoencoder encoder if fusion_method is 'by_autoencoder'
+
+        if self.fusion_method == 'by_autoencoder' and not self.autoencoders:
+            raise ValueError("Autoencoders must be provided when fusion_method is 'by_autoencoder'.")
+
+        if self.fusion_method == 'by_autoencoder':
+            user_emb = self._apply_autoencoder(user, 'user')
+            course_pos_emb = self._apply_autoencoder(course_positive, 'course_positive')
+            if self.use_bpr and course_negative is not None:
+                course_neg_emb = self._apply_autoencoder(course_negative, 'course_negative')
         else:
-            raise ValueError(f"Unknown fusion method: {self.fusion_method}")
-    
-    def forward(self, user_embeddings, course_embeddings, negative_course_embeddings=None):
-        """
-        Forward pass through multimodal model
-        
-        Args:
-            user_embeddings (dict): Pre-computed user embeddings for each modality
-                Example: {
-                    'text': tensor([batch_size, 768]),
-                    'scibert': tensor([batch_size, 768]),
-                    'numerical': tensor([batch_size, 50])
-                }
-            course_embeddings (dict): Pre-computed course embeddings for each modality
-            negative_course_embeddings (dict): Pre-computed negative course embeddings for BPR
-        
-        Returns:
-            dict: Model outputs including predictions and representations
-        """
-        user_modal_representations = {}
-        course_modal_representations = {}
-        
-        # Process each modality
-        for modality in self.modalities:
-            if modality in user_embeddings:
-                user_modal_representations[modality] = self.encode_user_modality(
-                    user_embeddings[modality], modality
-                )
-            
-            if modality in course_embeddings:
-                course_modal_representations[modality] = self.encode_course_modality(
-                    course_embeddings[modality], modality
-                )
-        
-        # Fuse modalities
-        user_representation = self.fuse_modalities(user_modal_representations, 'user')
-        course_representation = self.fuse_modalities(course_modal_representations, 'course')
-        
-        # Compute final prediction
-        if self.use_bpr and negative_course_embeddings is not None:
-            # BPR approach: compute positive and negative scores
-            positive_input = torch.cat([user_representation, course_representation], dim=-1)
-            positive_score = self.prediction_layer(positive_input).squeeze()
-            
-            # Encode negative courses
-            negative_course_modal_representations = {}
-            for modality in self.modalities:
-                if modality in negative_course_embeddings:
-                    negative_course_modal_representations[modality] = self.encode_course_modality(
-                        negative_course_embeddings[modality], modality
-                    )
-            
-            negative_course_representation = self.fuse_modalities(
-                negative_course_modal_representations, 'course'
-            )
-            negative_input = torch.cat([user_representation, negative_course_representation], dim=-1)
-            negative_score = self.prediction_layer(negative_input).squeeze()
-            
-            return {
-                'positive_score': positive_score,
-                'negative_score': negative_score,
-                'user_representation': user_representation,
-                'positive_course_representation': course_representation,
-                'negative_course_representation': negative_course_representation,
-                'user_modal_representations': user_modal_representations,
-                'course_modal_representations': course_modal_representations
-            }
+            user_emb = user
+            course_pos_emb = course_positive
+            if self.use_bpr and course_negative is not None:
+                course_neg_emb = course_negative
+            else:
+                course_neg_emb = None
+
+        # Pass through feature layers
+        user_feat = self.user_feature_layer(user_emb)
+        course_pos_feat = self.course_feature_layer(course_pos_emb)
+        if self.use_bpr and course_neg_emb is not None:
+            course_neg_feat = self.course_neg_feature_layer(course_neg_emb)
         else:
-            # Binary classification approach
-            combined_input = torch.cat([user_representation, course_representation], dim=-1)
-            prediction = self.prediction_layer(combined_input).squeeze()
+            course_neg_feat = None
+
+        # Example fusion (binary classification)
+        if not self.use_bpr:
+            fusion_input = torch.cat([user_feat, course_pos_feat], dim=-1)
+            out = self.fusion_layer_binary(fusion_input)
+            return out
+        else:
+            # For BPR, return all three features for custom loss
+            return user_feat, course_pos_feat, course_neg_feat
+        
+    def _feature_layer(input_dim, output_dim, number_of_layers=2, activation=nn.ReLU(), dropout_rate=0.2, reduction_factor=2):
+            """
+                Helper function to create a dense layer with activation and dropout.
+                the input dimension is reduced by reduction_factor after each layer.
+            Args:
+                input_dim (int): Dimension of input features
+                output_dim (int): Dimension of output features
+                number_of_layers (int): Number of dense layers to create
+                activation (nn.Module): Activation function to use
+                dropout_rate (float): Dropout rate for regularization
+                reduction_factor (int): Factor by which to reduce the dimension after each layer
+            Returns:
+                nn.Sequential: Sequential model containing the layers     
+            """
+            layers = []
+            prev_dim = input_dim
+            for i in range(number_of_layers):
+                next_dim = max(output_dim, prev_dim // reduction_factor)
+                layers.append(nn.Linear(prev_dim, next_dim))
+                if i < number_of_layers - 1:  # Don't add activation after last layer
+                    layers.append(activation)
+                    layers.append(nn.Dropout(dropout_rate))
+                prev_dim = next_dim
+            return nn.Sequential(*layers)
+    
+    def loss_bpr_function(self, user_feat, course_pos_feat, course_neg_feat):
+        """
+        Compute the BPR loss given user features, positive course features, and negative course features.
+        """
+        pos_scores = torch.sum(user_feat * course_pos_feat, dim=-1)
+        neg_scores = torch.sum(user_feat * course_neg_feat, dim=-1)
+        loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
+        return loss
+    
+    def loss_binary_function(self, predictions, targets):
+        """
+        Compute binary cross-entropy loss given predictions and targets.
+        """
+        loss = F.binary_cross_entropy_with_logits(predictions.squeeze(), targets.float())
+        return loss
+    
+    def train_model(self, data_loader, epochs=10, lr=1e-3):
+        """
+        Train the multimodal model.
+        Args:
+            data_loader (DataLoader): DataLoader providing training data
+            epochs (int): Number of training epochs
+            lr (float): Learning rate for optimizer
+        """
+        self.train()
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+        
+        for epoch in range(epochs):
+            total_loss = 0
+            for batch in data_loader:
+                user = batch['user']
+                course_positive = batch['course_positive']
+                if self.use_bpr:
+                    course_negative = batch['course_negative']
+                else:
+                    course_negative = None
+                targets = batch.get('targets', None)
+                
+                optimizer.zero_grad()
+                
+                if self.use_bpr:
+                    user_feat, course_pos_feat, course_neg_feat = self.forward(user, course_positive, course_negative)
+                    loss = self.loss_bpr_function(user_feat, course_pos_feat, course_neg_feat)
+                else:
+                    predictions = self.forward(user, course_positive)
+                    loss = self.loss_binary_function(predictions, targets)
+                
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
             
-            return {
-                'prediction': prediction,
-                'user_representation': user_representation,
-                'course_representation': course_representation,
-                'user_modal_representations': user_modal_representations,
-                'course_modal_representations': course_modal_representations
-            }
+            avg_loss = total_loss / len(data_loader)
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+
 
 
 class Autoencoder(nn.Module):
@@ -321,80 +278,22 @@ class Autoencoder(nn.Module):
         decoded = self.decode(encoded)
         return decoded, encoded
 
+    def loss_function(self, recon_x, x):
+        """Compute reconstruction loss (MSE)"""
+        loss = F.mse_loss(recon_x, x)
+        return loss
 
-def create_multimodal_model(modality_dims, **kwargs):
-    """
-    Factory function to create multimodal recommendation model.
-    
-    Args:
-        modality_dims (dict): Dictionary mapping modality names to embedding dimensions
-            Example: {'text': 768, 'scibert': 768, 'numerical': 50}
-        **kwargs: Additional arguments
-    
-    Returns:
-        MultimodalModel: Configured multimodal model
-    """
-    return MultimodalModel(
-        modality_dims=modality_dims,
-        shared_dim=kwargs.get('shared_dim', 128),
-        fusion_method=kwargs.get('fusion_method', 'concat'),
-        use_bpr=kwargs.get('use_bpr', False),
-        dropout_rate=kwargs.get('dropout_rate', 0.2)
-    )
-
-
-def create_autoencoder(autoencoder_type='basic', **kwargs):
-    """
-    Factory function to create different types of autoencoders.
-    
-    Args:
-        autoencoder_type (str): Type of autoencoder ('basic')
-        **kwargs: Additional arguments for specific autoencoder types
-    
-    Returns:
-        nn.Module: Autoencoder model
-    """
-    if autoencoder_type == 'basic':
-        return Autoencoder(
-            input_dim=kwargs.get('input_dim', 784),
-            encoding_dims=kwargs.get('encoding_dims', [512, 256, 128])
-        )
-    else:
-        raise ValueError(f"Unknown autoencoder type: {autoencoder_type}")
-
-
-def bpr_loss(positive_scores, negative_scores):
-    """
-    Compute BPR (Bayesian Personalized Ranking) loss.
-    
-    Args:
-        positive_scores (torch.Tensor): Scores for positive items
-        negative_scores (torch.Tensor): Scores for negative items
-    
-    Returns:
-        torch.Tensor: BPR loss
-    """
-    return -torch.mean(torch.log(torch.sigmoid(positive_scores - negative_scores)))
-
-
-def multimodal_loss_function(outputs, targets, loss_type='mse', modal_weights=None):
-    """
-    Compute loss for multimodal recommendation model.
-    
-    Args:
-        outputs: Model outputs
-        targets: Target values
-        loss_type (str): Type of loss ('mse', 'bce', 'bpr')
-        modal_weights: Weights for different modalities
-    
-    Returns:
-        torch.Tensor: Total loss
-    """
-    if loss_type == 'bpr':
-        return bpr_loss(outputs['positive_score'], outputs['negative_score'])
-    elif loss_type == 'mse':
-        return F.mse_loss(outputs['prediction'], targets)
-    elif loss_type == 'bce':
-        return F.binary_cross_entropy(outputs['prediction'], targets)
-    else:
-        raise ValueError(f"Unknown loss type: {loss_type}")
+    @staticmethod
+    def train_autoencoder(autoencoder, data, epochs=20, lr=1e-3):
+        autoencoder.train()
+        optimizer = optim.Adam(autoencoder.parameters(), lr=lr)
+        criterion = nn.MSELoss()
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            reconstructed, _ = autoencoder(data)
+            loss = criterion(reconstructed, data)
+            loss.backward()
+            optimizer.step()
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}")
+        return autoencoder
+            
