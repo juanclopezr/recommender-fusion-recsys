@@ -5,9 +5,89 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 import pickle
+import re
+from pathlib import Path
 from sklearn.preprocessing import LabelEncoder
 import os
 
+#function to load course_encoder from a pickle file
+def load_course_encoder(pkl_path, save_dir):
+    """
+    Load a pickle file with id2entity, filter out unwanted entities,
+    build mappings, and return a fitted LabelEncoder.
+
+    Args:
+        pkl_path (str or Path): path to the pickle file containing id2entity
+        save_dir (str or Path): directory where the filtered mappings will be saved
+
+    Returns:
+        tuple: (encoder, dicts)
+            encoder: sklearn LabelEncoder fitted on the filtered entities
+            dicts: {
+                "filtered_id2entity": dict,
+                "entity2newid": dict,
+                "newid2entity": dict,
+                "newid2oldid": dict
+            }
+    """
+    pkl_path = Path(pkl_path)
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    #if the pkl with new mappings already exists, load and return it
+    if (save_dir / "filtered_id2entity.pkl").exists() and (save_dir / "label_encoder.pkl").exists():
+        print(f"Loading existing mappings from {save_dir}")
+        with open(save_dir / "filtered_id2entity.pkl", "rb") as f:
+            filtered_id2entity = pickle.load(f)
+        with open(save_dir / "entity2newid.pkl", "rb") as f:
+            entity2newid = pickle.load(f)
+        with open(save_dir / "newid2entity.pkl", "rb") as f:
+            newid2entity = pickle.load(f)
+        with open(save_dir / "newid2oldid.pkl", "rb") as f:
+            newid2oldid = pickle.load(f)
+        with open(save_dir / "label_encoder.pkl", "rb") as f:
+            encoder = pickle.load(f)        
+
+        dicts = {
+            "filtered_id2entity": filtered_id2entity,
+            "entity2newid": entity2newid,
+            "newid2entity": newid2entity,
+            "newid2oldid": newid2oldid
+        }
+        return encoder, dicts
+
+    with open(pkl_path, "rb") as f:
+        id2entity = pickle.load(f)
+
+    pattern = re.compile(r'^[\d\.,]+$')
+
+    filtered_id2entity = {i: ent for i, ent in id2entity.items() if not pattern.match(str(ent))}
+
+    entity2newid = {ent: new_id for new_id, (old_id, ent) in enumerate(filtered_id2entity.items())}
+    newid2entity = {new_id: ent for ent, new_id in entity2newid.items()}
+    newid2oldid = {new_id: old_id for new_id, old_id in enumerate(filtered_id2entity.keys())}
+
+    dicts = {
+        "filtered_id2entity": filtered_id2entity,
+        "entity2newid": entity2newid,
+        "newid2entity": newid2entity,
+        "newid2oldid": newid2oldid
+    }
+
+    for name, data in dicts.items():
+        with open(save_dir / f"{name}.pkl", "wb") as f:
+            pickle.dump(data, f)
+    print(f"✅ Mappings saved in {save_dir}")
+
+    encoder = LabelEncoder()
+    encoder.fit(list(filtered_id2entity.values()))
+    print(f"✅ LabelEncoder trained with {len(filtered_id2entity)} valid entities")
+
+    with open(save_dir / "label_encoder.pkl", "wb") as f:
+        pickle.dump(encoder, f)
+    print("✅ LabelEncoder saved as label_encoder.pkl")
+
+    return encoder, dicts
 
 def preprocess_data(df):
     """
@@ -26,7 +106,7 @@ class SequentialDataset(Dataset):
     Dataset class for Sequential training data
     """
     def __init__(self, sequences, max_sequence_length, mask_token, mask_prob=0.2, 
-                 padding_token=0, mode="MASKED", sequential_model="BERT4Rec", min_sequence_length=4):
+                 padding_token=0, mode="MASKED", sequential_model="BERT4Rec", min_sequence_length=4, user2id=None, usercourse2id=None):
         self.sequences = sequences
         self.max_sequence_length = max_sequence_length
         self.mask_token = mask_token
@@ -35,11 +115,15 @@ class SequentialDataset(Dataset):
         self.mode = mode
         self.sequential_model = sequential_model
         self.min_sequence_length = min_sequence_length
+        self.user2id = user2id
+        self.usercourse2id = usercourse2id
         
         # Process sequences and create input/target pairs
-        if sequential_model == "BERT4Rec":
+        if self.sequential_model == "BERT4Rec":
+            print("Creating masked sequences for BERT4Rec")
             self.inputs, self.targets = self._create_masked_sequences()
         else:
+            print("Creating sequence pairs for Sequential Transformer")
             self.inputs, self.targets = self._create_sequence_pairs()
 
     def _create_sequence_pairs(self):
@@ -177,7 +261,6 @@ class CreateDataloaderSequential(object):
     def _process_sequences(self):
         """Process and encode sequences"""
         if self.course_encoder is None:
-            
             # Create course encoder
             all_courses = []
             for seq in self.user_sequences:
@@ -189,7 +272,22 @@ class CreateDataloaderSequential(object):
             
             # Add padding token
             self.course_encoder.classes_ = np.insert(self.course_encoder.classes_, 0, "<PAD>")
+
+            #print number of unique courses
+            print(f"Number of unique courses: {len(self.course_encoder.classes_)}")
         
+        else:
+            # Ensure padding token is in the classes
+            if "<PAD>" not in self.course_encoder.classes_:
+                #check that the class number 0 is not already used
+                if 0 in self.course_encoder.transform(self.course_encoder.classes_):
+                    self.course_encoder.classes_ = np.insert(self.course_encoder.classes_, 0, "<PAD>")
+                else:
+                    # Add padding token using the last index + 1
+                    self.course_encoder.classes_ = np.append(self.course_encoder.classes_, "<PAD>")
+                    #updated the padding token parameter
+                    self.padding_token = len(self.course_encoder.classes_) - 1
+
         # Encode sequences
         self.encoded_sequences = []
         for user_id, sequence in self.user_sequences.items():
@@ -241,7 +339,6 @@ class CreateDataloaderSequential(object):
             min_sequence_length=self.min_sequence_length,
             sequential_model=self.sequential_model
         )
-        
         return DataLoader(
             train_dataset,
             batch_size=self.batch_size,
@@ -258,7 +355,7 @@ class CreateDataloaderSequential(object):
             mask_token=self.mask_token,
             mask_prob=self.mask_prob,
             padding_token=self.padding_token,
-            mode="MASKED",  # Use MASKED mode for validation
+            mode=self.mode,  # Use MASKED mode for validation
             min_sequence_length=self.min_sequence_length,
             sequential_model=self.sequential_model
         )
@@ -279,7 +376,7 @@ class CreateDataloaderSequential(object):
             mask_token=self.mask_token,
             mask_prob=self.mask_prob,
             padding_token=self.padding_token,
-            mode="MASKED",  # Use MASKED mode for testing
+            mode=self.mode,  # Use MASKED mode for testing
             min_sequence_length=self.min_sequence_length,
             sequential_model=self.sequential_model
         )
@@ -368,7 +465,7 @@ class CreateDataloaderSequential(object):
 
 
 # Utility functions for integration with existing codebase
-def create_sequential_dataloader(args, df=None, max_sequence_size=None, user_sequences=None, course_encoder=None):
+def create_sequential_dataloader(args, df=None, user_sequences=None, course_encoder=None):
     """
     Function to create sequential dataloader
     

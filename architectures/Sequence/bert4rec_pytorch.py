@@ -10,7 +10,7 @@ import numpy as np
 
 # BERT4Rec Model
 class BERT4Rec(nn.Module):
-    def __init__(self, vocab_size, max_sequence_length, embedding_dim, num_heads, ff_dim, num_transformer_blocks, dropout_rate):
+    def __init__(self, vocab_size, max_sequence_length, embedding_dim, num_heads, ff_dim, num_transformer_blocks, dropout_rate, padding_idx=0):
         """
         Build a Transformer-based model for sequential recommendation.
         vocab_size: int, size of the vocabulary (number of unique courses + 1 MASK token + 1 for padding)
@@ -26,7 +26,7 @@ class BERT4Rec(nn.Module):
         self.vocab_size = vocab_size # including padding token but not mask token
         self.max_sequence_length = max_sequence_length
         self.embedding_dim = embedding_dim
-        self.padding_idx = 0
+        self.padding_idx = padding_idx
         
         # Item embedding
         self.item_embedding = nn.Embedding(vocab_size + 1, embedding_dim, padding_idx=self.padding_idx)
@@ -306,7 +306,7 @@ def generate_recommendations(model, sequence, course_encoder, max_sequence_lengt
 
 
 def generate_recommendations_test_dataset(model, encoded_train_sequences, encoded_test_sequences, 
-                                        course_encoder, mask_token, max_sequence_length, k, device='cuda'):
+                                        course_encoder, mask_token, max_sequence_length, k, device='cuda', padding_token=0):
     """
     Evaluate the model on the test set
     """
@@ -328,7 +328,7 @@ def generate_recommendations_test_dataset(model, encoded_train_sequences, encode
             # Generate recommendations
             _, recommended_courses_encoded = generate_recommendations(
                 model, current_sequence, course_encoder, max_sequence_length, k, 
-                mask_token=mask_token, device=device
+                mask_token=mask_token, device=device, padding_token=padding_token
             )
             
             courses_recommended_list.append(recommended_courses_encoded)
@@ -340,7 +340,7 @@ def generate_recommendations_test_dataset(model, encoded_train_sequences, encode
 
 # Factory function for creating the model
 def create_model(vocab_size, max_sequence_length=10, embedding_dim=128, 
-                         num_heads=8, ff_dim=512, num_transformer_blocks=6, dropout_rate=0.1):
+                         num_heads=8, ff_dim=512, num_transformer_blocks=6, dropout_rate=0.1, padding_idx=0):
     """
     Factory function to create BERT4Rec model
     """
@@ -351,7 +351,8 @@ def create_model(vocab_size, max_sequence_length=10, embedding_dim=128,
         num_heads=num_heads,
         ff_dim=ff_dim,
         num_transformer_blocks=num_transformer_blocks,
-        dropout_rate=dropout_rate
+        dropout_rate=dropout_rate,
+        padding_idx=padding_idx
     )
 
 

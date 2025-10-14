@@ -12,18 +12,18 @@ class MultimodalModel(nn.Module):
     and training with binary classification or BPR approach.
     """
     def __init__(self, modality_dims, shared_dim=128, fusion_method='concat', 
-                 use_bpr=False, dropout_rate=0.2, layers_per_modality=2, autoencoders=None):
+                 use_bpr=False, dropout_rate=0.2, layers_per_modality=[512, 256, 128], fusion_layers=[64, 32], autoencoders=None, autoencoder_output_dim=None):
         """
         Args:
-            modality_dims (dict): Dictionary mapping the respective 3 vectors (user, course_positive,
-            course_negative) with the dimension
-            Example: {'user': 128, 'course_positive': 128, 'course_negative': 128}
+            modality_dims (dict): Dictionary mapping the respective 2 vectors (user, course) with the dimension
+            Example: {'user': 128, 'course': 128}
             shared_dim (int): Dimension of shared representation space
             fusion_method (str): Method for fusing modalities ('concat', 'by_autoencoder'.)
             use_bpr (bool): Whether to use BPR (Bayesian Personalized Ranking) approach, False for binary classification
             dropout_rate (float): Dropout rate for regularization
-            layers_per_modality (int): Number of dense layers per modality 
-            autoencoders (dict or list): Dictionary or list mapping modality names ('user', 'course_positive', 'course_negative') to autoencoder models. Only used if fusion_method == 'by_autoencoder'.
+            layers_per_modality (list): Number of dense layers per modality
+            autoencoders (dict or list): Dictionary or list mapping modality names ('user', 'course') to autoencoder models. Only used if fusion_method == 'by_autoencoder'.
+            autoencoder_output_dim (int): Output dimension of the autoencoder encoder. Only used if fusion_method == 'by_autoencoder'.
         """
         super(MultimodalModel, self).__init__()
         self.modality_dims = modality_dims
@@ -32,54 +32,64 @@ class MultimodalModel(nn.Module):
         self.use_bpr = use_bpr
         self.dropout_rate = dropout_rate
         self.user_vec_dim = modality_dims['user']
-        self.course_pos_vec_dim = modality_dims['course_positive']
-        # Negative course vector dimension in the case of BPR, otherwise not included
-        if use_bpr:
-            self.course_neg_vec_dim = modality_dims['course_negative']
-        else:
-            self.course_neg_vec_dim = 0
+        self.course_vec_dim = modality_dims['course']
+        self.layers_per_modality = layers_per_modality
+        self.fusion_layers = fusion_layers
+        self.autoencoder_output_dim = autoencoder_output_dim
 
         # Store autoencoders for each modality (if provided)
         self.autoencoders = autoencoders if autoencoders is not None else {}
 
+        #Freze autoencoder parameters if using autoencoder fusion
+        if self.fusion_method == 'by_autoencoder' and self.autoencoders:
+            for _, autoencoder in self.autoencoders.items():
+                for param in autoencoder.parameters():
+                    param.requires_grad = False
+
         # Define feature layers for user and course modalities
+        if self.fusion_method == 'concat':
+            dimensions_user_layer = self.user_vec_dim
+        else:
+            dimensions_user_layer = self.autoencoder_output_dim
+
+        print(f"User feature layer input dim: {dimensions_user_layer}")
         self.user_feature_layer = self._feature_layer(
-            input_dim=self.user_vec_dim,
+            input_dim=dimensions_user_layer,
             output_dim=self.shared_dim,
-            number_of_layers=layers_per_modality,
-            activation=nn.ReLU(),
-            dropout_rate=dropout_rate,
-            reduction_factor=2
+            number_of_layers=self.layers_per_modality,
+            dropout_rate=self.dropout_rate
         )
 
+        if self.fusion_method == 'concat':
+            dimensions_course_layer = self.course_vec_dim
+        else:
+            dimensions_course_layer = self.autoencoder_output_dim
+
+        print(f"Course feature layer input dim: {dimensions_course_layer}")
         self.course_feature_layer = self._feature_layer(
-            input_dim=self.course_pos_vec_dim,
+            input_dim=dimensions_course_layer,
             output_dim=self.shared_dim,
-            number_of_layers=layers_per_modality,
-            activation=nn.ReLU(),
-            dropout_rate=dropout_rate,
-            reduction_factor=2
+            number_of_layers=self.layers_per_modality,
+            dropout_rate=self.dropout_rate
         )
 
         if self.use_bpr:
+
             self.course_neg_feature_layer = self._feature_layer(
-                input_dim=self.course_neg_vec_dim,
+                input_dim=dimensions_course_layer,
                 output_dim=self.shared_dim,
-                number_of_layers=layers_per_modality,
-                activation=nn.ReLU(),
-                dropout_rate=dropout_rate,
-                reduction_factor=2
+                number_of_layers=self.layers_per_modality,
+                dropout_rate=self.dropout_rate
             )
 
-        # Fusion layer for combined user and course features for binary classification
-        self.fusion_layer_binary = self._feature_layer(
-            input_dim=self.shared_dim * 2,
-            output_dim=1, # Binary classification output
-            number_of_layers=self.layers_per_modality,
-            activation=nn.ReLU(),
-            dropout_rate=self.dropout_rate,
-            reduction_factor=2
-        )
+        else:
+            # Fusion layer for combined user and course features for binary classification
+            self.fusion_layer_binary = self._feature_layer(
+                input_dim=self.shared_dim * 2,
+                output_dim=1, # Binary classification output
+                number_of_layers=self.fusion_layers,
+                dropout_rate=self.dropout_rate
+            )
 
     def _apply_autoencoder(self, x, modality):
         """
@@ -97,9 +107,9 @@ class MultimodalModel(nn.Module):
 
         if self.fusion_method == 'by_autoencoder':
             user_emb = self._apply_autoencoder(user, 'user')
-            course_pos_emb = self._apply_autoencoder(course_positive, 'course_positive')
+            course_pos_emb = self._apply_autoencoder(course_positive, 'course')
             if self.use_bpr and course_negative is not None:
-                course_neg_emb = self._apply_autoencoder(course_negative, 'course_negative')
+                course_neg_emb = self._apply_autoencoder(course_negative, 'course')
         else:
             user_emb = user
             course_pos_emb = course_positive
@@ -122,42 +132,75 @@ class MultimodalModel(nn.Module):
             out = self.fusion_layer_binary(fusion_input)
             return out
         else:
-            # For BPR, return all three features for custom loss
-            return user_feat, course_pos_feat, course_neg_feat
-        
-    def _feature_layer(input_dim, output_dim, number_of_layers=2, activation=nn.ReLU(), dropout_rate=0.2, reduction_factor=2):
+            # For BPR mode
+            if course_neg_feat is not None:
+                # Training mode: return all three features for BPR loss
+                return user_feat, course_pos_feat, course_neg_feat
+            else:
+                # Inference mode: return only user and positive course features, or compute similarity score
+                # Return similarity score between user and positive course for ranking
+                similarity_scores = torch.sum(user_feat * course_pos_feat, dim=-1, keepdim=True)
+                return similarity_scores
+
+    def _feature_layer(self, input_dim, output_dim, number_of_layers=[512, 256, 128], activation=nn.Tanh(), dropout_rate=0.2):
             """
                 Helper function to create a dense layer with activation and dropout.
-                the input dimension is reduced by reduction_factor after each layer.
             Args:
                 input_dim (int): Dimension of input features
                 output_dim (int): Dimension of output features
-                number_of_layers (int): Number of dense layers to create
+                number_of_layers (list): List of dense layer sizes to create
                 activation (nn.Module): Activation function to use
                 dropout_rate (float): Dropout rate for regularization
-                reduction_factor (int): Factor by which to reduce the dimension after each layer
             Returns:
                 nn.Sequential: Sequential model containing the layers     
             """
+            # Raise and exception if the last layer dimension is bigger than output_dim
+            if number_of_layers[-1] < output_dim:
+                raise ValueError("The last layer dimension must be greater than or equal to output_dim")
+
             layers = []
-            prev_dim = input_dim
-            for i in range(number_of_layers):
-                next_dim = max(output_dim, prev_dim // reduction_factor)
-                layers.append(nn.Linear(prev_dim, next_dim))
-                if i < number_of_layers - 1:  # Don't add activation after last layer
+            for i, dim in enumerate(number_of_layers):
+                if i == 0:
+                    layers.append(nn.Linear(input_dim, dim))
+                else:
+                    layers.append(nn.Linear(number_of_layers[i-1], dim))
+                if i < len(number_of_layers) - 1:  # Don't add activation after last layer
                     layers.append(activation)
                     layers.append(nn.Dropout(dropout_rate))
-                prev_dim = next_dim
+            layers.append(nn.Linear(number_of_layers[-1], output_dim))
             return nn.Sequential(*layers)
     
-    def loss_bpr_function(self, user_feat, course_pos_feat, course_neg_feat):
+    def loss_bpr_function(self, user_feat, course_pos_feat, course_neg_feat, reg_lambda=5e-3):
         """
-        Compute the BPR loss given user features, positive course features, and negative course features.
+        Compute the BPR loss with regularization given user features, positive course features, and negative course features.
+        
+        Args:
+            user_feat: User feature embeddings
+            course_pos_feat: Positive course feature embeddings  
+            course_neg_feat: Negative course feature embeddings
+            reg_lambda: Regularization strength (default: 5e-3)
+        
+        Returns:
+            Total loss including BPR loss and regularization term
         """
+        # Compute BPR scores
         pos_scores = torch.sum(user_feat * course_pos_feat, dim=-1)
         neg_scores = torch.sum(user_feat * course_neg_feat, dim=-1)
-        loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
-        return loss
+        
+        # BPR loss
+        bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
+        
+        # L2 regularization on feature embeddings
+        user_reg = torch.mean(user_feat ** 2)
+        pos_reg = torch.mean(course_pos_feat ** 2)
+        neg_reg = torch.mean(course_neg_feat ** 2)
+        
+        regularization_loss = reg_lambda * (user_reg + pos_reg + neg_reg)
+        
+        # Total loss
+        total_loss = bpr_loss + regularization_loss
+        
+        return total_loss
     
     def loss_binary_function(self, predictions, targets):
         """
@@ -166,27 +209,68 @@ class MultimodalModel(nn.Module):
         loss = F.binary_cross_entropy_with_logits(predictions.squeeze(), targets.float())
         return loss
     
-    def train_model(self, data_loader, epochs=10, lr=1e-3):
+    def predict_scores(self, user, course_positive):
         """
-        Train the multimodal model.
+        Compute similarity scores for user-course pairs during inference.
+        This method is specifically for inference mode and doesn't require negative courses.
+        
         Args:
-            data_loader (DataLoader): DataLoader providing training data
+            user: User feature vectors
+            course_positive: Course feature vectors
+            
+        Returns:
+            Similarity scores between users and courses
+        """
+        self.eval()
+        with torch.no_grad():
+            # Call forward with course_negative=None to trigger inference mode
+            scores = self.forward(user, course_positive, course_negative=None)
+            return scores
+    
+    def train_model(self, train_loader, val_loader=None, epochs=10, lr=1e-3, save_path=None, device='cuda'):
+        """
+        Train the multimodal model with validation support and best model saving.
+        Args:
+            train_loader (DataLoader): DataLoader providing training data
+            val_loader (DataLoader, optional): DataLoader providing validation data
             epochs (int): Number of training epochs
             lr (float): Learning rate for optimizer
+            save_path (str, optional): Path to save the best model
+            device (str): Device to train on ('cpu' or 'cuda')
         """
-        self.train()
+        # Move model to device
+        self = self.to(device)
         optimizer = optim.Adam(self.parameters(), lr=lr)
         
+        # Initialize tracking variables
+        best_val_loss = float('inf')
+        best_model_state = None
+        train_losses = []
+        val_losses = []
+        
+        print(f"Training multimodal model for {epochs} epochs...")
+        if val_loader is not None:
+            print(f"Using validation dataset with {len(val_loader)} batches")
+        else:
+            print("No validation dataset provided - using training loss for model selection")
+        
         for epoch in range(epochs):
-            total_loss = 0
-            for batch in data_loader:
-                user = batch['user']
-                course_positive = batch['course_positive']
+            # Training phase
+            self.train()
+            total_train_loss = 0
+            num_train_batches = 0
+            
+            for batch in train_loader:
+                # Move batch data to device
+                user = batch['user'].to(device)
+                course_positive = batch['course_positive'].to(device)
                 if self.use_bpr:
-                    course_negative = batch['course_negative']
+                    course_negative = batch['course_negative'].to(device)
                 else:
                     course_negative = None
                 targets = batch.get('targets', None)
+                if targets is not None:
+                    targets = targets.to(device)
                 
                 optimizer.zero_grad()
                 
@@ -195,15 +279,124 @@ class MultimodalModel(nn.Module):
                     loss = self.loss_bpr_function(user_feat, course_pos_feat, course_neg_feat)
                 else:
                     predictions = self.forward(user, course_positive)
+                    print(predictions, targets)
                     loss = self.loss_binary_function(predictions, targets)
                 
                 loss.backward()
                 optimizer.step()
                 
-                total_loss += loss.item()
+                total_train_loss += loss.item()
+                num_train_batches += 1
             
-            avg_loss = total_loss / len(data_loader)
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+            avg_train_loss = total_train_loss / num_train_batches
+            train_losses.append(avg_train_loss)
+            
+            # Validation phase
+            if val_loader is not None:
+                self.eval()
+                total_val_loss = 0
+                num_val_batches = 0
+                
+                with torch.no_grad():
+                    for batch in val_loader:
+                        # Move batch data to device
+                        user = batch['user'].to(device)
+                        course_positive = batch['course_positive'].to(device)
+                        if self.use_bpr:
+                            course_negative = batch['course_negative'].to(device)
+                        else:
+                            course_negative = None
+                        targets = batch.get('targets', None)
+                        if targets is not None:
+                            targets = targets.to(device)
+                        
+                        if self.use_bpr:
+                            user_feat, course_pos_feat, course_neg_feat = self.forward(user, course_positive, course_negative)
+                            val_loss = self.loss_bpr_function(user_feat, course_pos_feat, course_neg_feat)
+                        else:
+                            predictions = self.forward(user, course_positive)
+                            val_loss = self.loss_binary_function(predictions, targets)
+                        
+                        total_val_loss += val_loss.item()
+                        num_val_batches += 1
+                
+                avg_val_loss = total_val_loss / num_val_batches
+                val_losses.append(avg_val_loss)
+                current_val_loss = avg_val_loss
+            else:
+                # If no validation data, use training loss for model selection
+                current_val_loss = avg_train_loss
+                val_losses.append(avg_train_loss)
+            
+            # Save best model based on validation loss (or training loss if no validation)
+            if current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
+                best_model_state = self.state_dict().copy()
+                if save_path:
+                    torch.save(best_model_state, save_path)
+                    print(f"✅ New best model saved at epoch {epoch+1} with val_loss: {best_val_loss:.6f}")
+            
+            # Print progress
+            if val_loader is not None:
+                print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.6f}, "
+                      f"Val Loss: {avg_val_loss:.6f}, Best Val Loss: {best_val_loss:.6f}")
+            else:
+                print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.6f}, "
+                      f"Best Loss: {best_val_loss:.6f}")
+        
+        # Load best model state
+        if best_model_state is not None:
+            self.load_state_dict(best_model_state)
+            if val_loader is not None:
+                print(f"🎯 Training completed. Best validation loss: {best_val_loss:.6f}")
+            else:
+                print(f"🎯 Training completed. Best training loss: {best_val_loss:.6f}")
+    
+    def generate_k_recommendations(self, course_embeddings_dict, user_tensor, k=5, device='cuda'):
+        """
+        Generate top-k course recommendations for a user based on similarity scores.
+        
+        Args:
+            course_embeddings_dict (dict): Dictionary mapping course_id to course embedding tensors
+                                         Example: {'course_1': tensor, 'course_2': tensor, ...}
+            user_tensor (torch.Tensor): User embedding tensor of shape [1, user_dim] or [num_users, user_dim]
+            k (int): Number of top recommendations to return (default: 5)
+            device (str): Device to run inference on ('cpu' or 'cuda')
+            
+        Returns:
+            list: List of course_id sorted by score in descending order
+        """
+        self = self.to(device)
+        self.eval()
+
+        if user_tensor.dim() == 1:
+            user_tensor = user_tensor.unsqueeze(0)  # [1, user_dim]
+        user_tensor = user_tensor.to(device)  # [batch, dim]
+
+        # Pre-stack all course embeddings once
+        course_ids = list(course_embeddings_dict.keys())
+        course_embs = torch.stack([course_embeddings_dict[cid] for cid in course_ids]).to(device)  # [num_courses, dim]
+
+        with torch.no_grad():
+            # Compute scores between all users and all courses
+            # For example, cosine similarity or using your model's predict_scores
+            # If using a custom method, loop over course_embs batchwise to avoid OOM
+            scores = []
+            for u in user_tensor:
+                # Expand user [dim] to match courses
+                u_expand = u.unsqueeze(0).repeat(course_embs.size(0), 1)
+                s = self.predict_scores(u_expand, course_embs).squeeze()
+                scores.append(s)
+            scores = torch.stack(scores)  # [num_users, num_courses]
+
+        # Get top-k indices per user
+        topk_scores, topk_indices = torch.topk(scores, k, dim=1)
+        topk_course_ids = [[course_ids[i] for i in idx_row] for idx_row in topk_indices.tolist()]
+
+        return topk_course_ids  # list of lists of course_ids
+
+
+        
 
 
 
@@ -284,16 +477,99 @@ class Autoencoder(nn.Module):
         return loss
 
     @staticmethod
-    def train_autoencoder(autoencoder, data, epochs=20, lr=1e-3):
-        autoencoder.train()
+    def train_autoencoder(autoencoder, data, epochs=20, lr=1e-3, save_path=None, device='cpu', validation_split=0.2):
+        """
+        Train the autoencoder and save the best model based on lowest validation loss.
+        
+        Args:
+            autoencoder: The autoencoder model to train
+            data: Training data tensor
+            epochs: Number of training epochs
+            lr: Learning rate
+            save_path: Path to save the best model (optional)
+            device: Device to train on ('cpu' or 'cuda')
+            validation_split: Fraction of data to use for validation (0.0 to 1.0)
+        
+        Returns:
+            Trained autoencoder model
+        """
+        autoencoder = autoencoder.to(device)
+        data = data.to(device)
+        
+        # Split data into training and validation sets
+        if validation_split > 0.0:
+            num_samples = data.shape[0]
+            num_val = int(num_samples * validation_split)
+            
+            # Shuffle indices for random split
+            indices = torch.randperm(num_samples)
+            val_indices = indices[:num_val]
+            train_indices = indices[num_val:]
+            
+            train_data = data[train_indices]
+            val_data = data[val_indices]
+            
+            print(f"Data split: {len(train_data)} training samples, {len(val_data)} validation samples")
+        else:
+            train_data = data
+            val_data = None
+            print(f"No validation split - using all {len(train_data)} samples for training")
+        
         optimizer = optim.Adam(autoencoder.parameters(), lr=lr)
         criterion = nn.MSELoss()
+        
+        best_val_loss = float('inf')
+        best_model_state = None
+        
+        print(f"Training autoencoder for {epochs} epochs...")
+        
         for epoch in range(epochs):
+            # Training phase
+            autoencoder.train()
             optimizer.zero_grad()
-            reconstructed, _ = autoencoder(data)
-            loss = criterion(reconstructed, data)
-            loss.backward()
+            train_reconstructed, _ = autoencoder(train_data)
+            train_loss = criterion(train_reconstructed, train_data)
+            train_loss.backward()
             optimizer.step()
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}")
+            
+            # Validation phase
+            autoencoder.eval()
+            with torch.no_grad():
+                if val_data is not None:
+                    val_reconstructed, _ = autoencoder(val_data)
+                    val_loss = criterion(val_reconstructed, val_data)
+                    current_val_loss = val_loss.item()
+                else:
+                    # If no validation data, use training loss for model selection
+                    current_val_loss = train_loss.item()
+            
+            current_train_loss = train_loss.item()
+            
+            # Save best model based on validation loss (or training loss if no validation)
+            if current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
+                best_model_state = autoencoder.state_dict().copy()
+                if save_path:
+                    torch.save(best_model_state, save_path)
+                    print(f"✅ New best model saved at epoch {epoch+1} with val_loss: {best_val_loss:.6f}")
+            
+            # Print progress
+            if (epoch + 1) % 5 == 0 or epoch == 0:  # Print every 5 epochs and first epoch
+                if val_data is not None:
+                    print(f"Epoch {epoch+1}/{epochs}, Train Loss: {current_train_loss:.6f}, "
+                          f"Val Loss: {current_val_loss:.6f}, Best Val Loss: {best_val_loss:.6f}")
+                else:
+                    print(f"Epoch {epoch+1}/{epochs}, Train Loss: {current_train_loss:.6f}, "
+                          f"Best Loss: {best_val_loss:.6f}")
+        
+        # Load best model state
+        if best_model_state is not None:
+            autoencoder.load_state_dict(best_model_state)
+            if val_data is not None:
+                print(f"🎯 Training completed. Best validation loss: {best_val_loss:.6f}")
+            else:
+                print(f"🎯 Training completed. Best training loss: {best_val_loss:.6f}")
+        
         return autoencoder
+    
             
