@@ -73,14 +73,18 @@ class MultimodalModel(nn.Module):
             dropout_rate=self.dropout_rate
         )
 
-        if self.use_bpr:
+        # Learnable fusion weights for modalities
+        self.alpha_user = nn.Parameter(torch.tensor(0.5))
+        self.alpha_course = nn.Parameter(torch.tensor(0.5))
 
-            self.course_neg_feature_layer = self._feature_layer(
-                input_dim=dimensions_course_layer,
-                output_dim=self.shared_dim,
-                number_of_layers=self.layers_per_modality,
-                dropout_rate=self.dropout_rate
-            )
+        if self.use_bpr:
+            pass
+            # self.course_neg_feature_layer = self._feature_layer(
+            #     input_dim=dimensions_course_layer,
+            #     output_dim=self.shared_dim,
+            #     number_of_layers=self.layers_per_modality,
+            #     dropout_rate=self.dropout_rate
+            # )
 
         else:
             # Fusion layer for combined user and course features for binary classification
@@ -100,51 +104,43 @@ class MultimodalModel(nn.Module):
         return x
     
     def forward(self, user, course_positive, course_negative=None):
-        # Apply autoencoder encoder if fusion_method is 'by_autoencoder'
-
-        course_neg_emb = None
-
-        if self.fusion_method == 'by_autoencoder' and not self.autoencoders:
-            raise ValueError("Autoencoders must be provided when fusion_method is 'by_autoencoder'.")
-
         if self.fusion_method == 'by_autoencoder':
             user_emb = self._apply_autoencoder(user, 'user')
             course_pos_emb = self._apply_autoencoder(course_positive, 'course')
-            if self.use_bpr and course_negative is not None:
-                course_neg_emb = self._apply_autoencoder(course_negative, 'course')
+            course_neg_emb = self._apply_autoencoder(course_negative, 'course') if (self.use_bpr and course_negative is not None) else None
         else:
             user_emb = user
             course_pos_emb = course_positive
-            if self.use_bpr and course_negative is not None:
-                course_neg_emb = course_negative
-            else:
-                course_neg_emb = None
+            course_neg_emb = course_negative if (self.use_bpr and course_negative is not None) else None
 
         # Pass through feature layers
         user_feat = self.user_feature_layer(user_emb)
         course_pos_feat = self.course_feature_layer(course_pos_emb)
-        if self.use_bpr and course_neg_emb is not None:
-            course_neg_feat = self.course_neg_feature_layer(course_neg_emb)
-        else:
-            course_neg_feat = None
+        course_neg_feat = self.course_feature_layer(course_neg_emb) if course_neg_emb is not None else None
 
-        # Example fusion (binary classification)
+        user_feat = F.normalize(user_feat, p=2, dim=-1)
+        course_pos_feat = F.normalize(course_pos_feat, p=2, dim=-1)
+        if course_neg_feat is not None:
+            course_neg_feat = F.normalize(course_neg_feat, p=2, dim=-1)
+
+        # Learnable weighted fusion (if more modalities were added)
+        user_feat = self.alpha_user * user_feat
+        course_pos_feat = self.alpha_course * course_pos_feat
+        if course_neg_feat is not None:
+            course_neg_feat = self.alpha_course * course_neg_feat
+
         if not self.use_bpr:
             fusion_input = torch.cat([user_feat, course_pos_feat], dim=-1)
             out = self.fusion_layer_binary(fusion_input)
             return out
         else:
-            # For BPR mode
             if course_neg_feat is not None:
-                # Training mode: return all three features for BPR loss
                 return user_feat, course_pos_feat, course_neg_feat
             else:
-                # Inference mode: return only user and positive course features, or compute similarity score
-                # Return similarity score between user and positive course for ranking
                 similarity_scores = torch.sum(user_feat * course_pos_feat, dim=-1, keepdim=True)
                 return similarity_scores
 
-    def _feature_layer(self, input_dim, output_dim, number_of_layers=[512, 256, 128], activation=nn.Tanh(), dropout_rate=0.2):
+    def _feature_layer(self, input_dim, output_dim, number_of_layers=[512, 256, 128], activation=nn.LeakyReLU(), dropout_rate=0.2):
             """
                 Helper function to create a dense layer with activation and dropout.
             Args:
@@ -172,36 +168,20 @@ class MultimodalModel(nn.Module):
             layers.append(nn.Linear(number_of_layers[-1], output_dim))
             return nn.Sequential(*layers)
     
-    def loss_bpr_function(self, user_feat, course_pos_feat, course_neg_feat, reg_lambda=5e-3):
-        """
-        Compute the BPR loss with regularization given user features, positive course features, and negative course features.
-        
-        Args:
-            user_feat: User feature embeddings
-            course_pos_feat: Positive course feature embeddings  
-            course_neg_feat: Negative course feature embeddings
-            reg_lambda: Regularization strength (default: 5e-3)
-        
-        Returns:
-            Total loss including BPR loss and regularization term
-        """
-        # Compute BPR scores
+
+    def loss_bpr_function(self, user_feat, course_pos_feat, course_neg_feat, reg_lambda=5e-3, alpha_reg_lambda=1e-4):
+        # BPR loss
         pos_scores = torch.sum(user_feat * course_pos_feat, dim=-1)
         neg_scores = torch.sum(user_feat * course_neg_feat, dim=-1)
-        
-        # BPR loss
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
-        
-        # L2 regularization on feature embeddings
+
+        # Regularization
         user_reg = torch.mean(user_feat ** 2)
         pos_reg = torch.mean(course_pos_feat ** 2)
         neg_reg = torch.mean(course_neg_feat ** 2)
-        
-        regularization_loss = reg_lambda * (user_reg + pos_reg + neg_reg)
-        
-        # Total loss
-        total_loss = bpr_loss + regularization_loss
-        
+        fusion_reg = (self.alpha_user ** 2 + self.alpha_course ** 2) * alpha_reg_lambda
+
+        total_loss = bpr_loss + reg_lambda * (user_reg + pos_reg + neg_reg) + fusion_reg
         return total_loss
     
     def loss_binary_function(self, predictions, targets):
@@ -241,7 +221,7 @@ class MultimodalModel(nn.Module):
             device (str): Device to train on ('cpu' or 'cuda')
         """
         # Move model to device
-        self = self.to(device)
+        self.to(device)
         optimizer = optim.Adam(self.parameters(), lr=lr)
         
         # Initialize tracking variables
