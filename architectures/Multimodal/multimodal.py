@@ -102,6 +102,8 @@ class MultimodalModel(nn.Module):
     def forward(self, user, course_positive, course_negative=None):
         # Apply autoencoder encoder if fusion_method is 'by_autoencoder'
 
+        course_neg_emb = None
+
         if self.fusion_method == 'by_autoencoder' and not self.autoencoders:
             raise ValueError("Autoencoders must be provided when fusion_method is 'by_autoencoder'.")
 
@@ -279,7 +281,6 @@ class MultimodalModel(nn.Module):
                     loss = self.loss_bpr_function(user_feat, course_pos_feat, course_neg_feat)
                 else:
                     predictions = self.forward(user, course_positive)
-                    print(predictions, targets)
                     loss = self.loss_binary_function(predictions, targets)
                 
                 loss.backward()
