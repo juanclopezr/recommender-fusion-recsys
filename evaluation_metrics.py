@@ -6,7 +6,7 @@ def calculate_custom_precision_at_k(true_items, predicted_items, k):
     total_precision = 0.0
     denominator = k
     if len(true_items) > 0 and len(predicted_items) >= k:
-        for predicted_item in predicted_items:
+        for predicted_item in predicted_items[:k]:
             if predicted_item in true_items:
                 total_precision += 1.0
     elif len(predicted_items) < k:
@@ -40,7 +40,7 @@ def calculate_average_custom_precision_at_k(true_items, predicted_items, k):
     """Calculates Custom Average Precision at k."""
     total_ap = 0.0
     for true_item, predicted_list in zip(true_items, predicted_items):
-        total_ap += calculate_custom_precision_at_k(true_item, predicted_list, k)
+        total_ap += calculate_custom_precision_at_k(true_item, predicted_list[:k], k)
     return total_ap / len(true_items) if true_items else 0.0
 
 #Mean Reciprocal Rank

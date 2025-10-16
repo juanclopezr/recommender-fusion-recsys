@@ -3,21 +3,18 @@ import numpy as np
 import os
 import torch
 import pandas as pd
-
+import sys
 
 
 from tqdm import tqdm
 
-os.chdir('/home/jcsanguino10/local_citation_model/Secuencial SR')
+sys.path.append('/home/jcsanguino10/local_citation_model/Secuencial SR')
 from evaluation_metrics import calculate_average_mrr, calculate_average_precision_at_k, calculate_average_ndcg_at_k, calculate_average_custom_precision_at_k
 
-os.chdir('/home/jcsanguino10/local_citation_model/recommender-fusion-recsys/loaders')
+sys.path.append('/home/jcsanguino10/local_citation_model/recommender-fusion-recsys/loaders')
 from create_dataloader_sequential import (load_course_encoder)
 
-os.chdir('/home/jcsanguino10/local_citation_model/recommender-fusion-recsys/architectures/Sequence')
-from sec_transformer_pytorch import (create_model, load_pytorch_weights)
-
-os.chdir('/home/jcsanguino10/local_citation_model/recommender-fusion-recsys/architectures/Multimodal')
+sys.path.append('/home/jcsanguino10/local_citation_model/recommender-fusion-recsys/architectures/Multimodal')
 from multimodal import Autoencoder, MultimodalModel
 
 if torch.cuda.is_available():
@@ -196,96 +193,110 @@ class BinaryDataset(torch.utils.data.Dataset):
             'targets': torch.tensor(label, dtype=torch.float)
         }
 
-def test_multimodal_model(columns_to_concat_courses, columns_to_concat_users, encoding_dims, shared_dimensions, layers_per_modality, regularization_bpr_values=[0.1], epochs=30, k=5, batch_size=64, pickle_results_path=None):
-    # Concatenate columns to create full embeddings
-    df_binary_temp = concat_columns_to_tensor(df_binary, columns_to_concat_courses, 'course_full_embeddings')
-    df_binary_temp = concat_columns_to_tensor(df_binary_temp, columns_to_concat_users, 'user_full_embeddings')
+def test_multimodal_model(columns_combinations, encoding_dims, shared_dimensions, layers_per_modality, regularization_bpr_values=[0.1], epochs=30, k=5, batch_size=64, pickle_results_path=None, verbose=True):
 
-    # For BPR DataFrame the prefix pos and neg is added to the columns_to_concat lists
-    df_bpr_temp = concat_columns_to_tensor(df_bpr, [f'pos_{col}' for col in columns_to_concat_courses], 'pos_course_full_embeddings')
-    df_bpr_temp = concat_columns_to_tensor(df_bpr_temp, [f'neg_{col}' for col in columns_to_concat_courses], 'neg_course_full_embeddings')
-    df_bpr_temp = concat_columns_to_tensor(df_bpr_temp, columns_to_concat_users, 'user_full_embeddings')
+    #caculate the  total number of combinations to use tqdm
+    total_combinations = len(columns_combinations) * 2 * (1 + len(regularization_bpr_values))
+    print(f"Total combinations to test: {total_combinations}")
 
-    # Create tensors for courses and users
-    course_tensor = [torch.tensor(x, dtype=torch.float) for x in df_binary_temp['course_full_embeddings'].values]
-    embeddings_course_tensor = torch.stack(course_tensor)
-
-    user_tensor = [torch.tensor(x, dtype=torch.float) for x in df_binary_temp['user_full_embeddings'].values]
-    embeddings_user_tensor = torch.stack(user_tensor)
-    
-    # Define a unique saving path based on the columns used
-    saving_path = PATH_TO_CHECKPOINTS + '_'.join([col.split('_')[1] for col in columns_to_concat_users])
-
-    course_encoder = train_autoencoder_and_extract_encoder(embeddings_course_tensor, embeddings_course_tensor.shape[1], encoding_dims, save_path=f'{saving_path}_encoder_course.pth' ,epochs=100, lr=1e-3, verbose=False)
-
-    user_encoder = train_autoencoder_and_extract_encoder(embeddings_user_tensor, embeddings_user_tensor.shape[1], encoding_dims, save_path=f'{saving_path}_encoder_user.pth', epochs=100, lr=1e-3, verbose=False)
-
-    modality_dims = {
-        'course': embeddings_course_tensor.shape[1],
-        'user': embeddings_user_tensor.shape[1]
-    }
-
-    # Create combinations parameters for the multimodal model (with/without autoencoder fusion) method and with BPR or Binary loss then for each combination create the model and test it.   
-
-    combinations_user_bpr = [True, False]
-    combinations_fusion_method = ['concat', 'by_autoencoder']
-
+    #start process bar for tqdm
+    pbar = tqdm(total=total_combinations)
     results = []
+    for columns_to_concat_courses, columns_to_concat_users in columns_combinations:
+        if verbose:
+            print(f"Testing combination: Courses - {columns_to_concat_courses}, Users - {columns_to_concat_users}")
+        else:
+            pbar.set_description(f"Courses - {columns_to_concat_courses}, Users - {columns_to_concat_users}")
+            sys.stdout = open(os.devnull, 'w')
+        # Concatenate columns to create full embeddings
+        df_binary_temp = concat_columns_to_tensor(df_binary, columns_to_concat_courses, 'course_full_embeddings')
+        df_binary_temp = concat_columns_to_tensor(df_binary_temp, columns_to_concat_users, 'user_full_embeddings')
 
-    for use_bpr in combinations_user_bpr:
-        for fusion_method in combinations_fusion_method:
-            temp_regularization_bpr_values = regularization_bpr_values if use_bpr else [0.0]
-            for reg_lambda in temp_regularization_bpr_values:
+        # For BPR DataFrame the prefix pos and neg is added to the columns_to_concat lists
+        df_bpr_temp = concat_columns_to_tensor(df_bpr, [f'pos_{col}' for col in columns_to_concat_courses], 'pos_course_full_embeddings')
+        df_bpr_temp = concat_columns_to_tensor(df_bpr_temp, [f'neg_{col}' for col in columns_to_concat_courses], 'neg_course_full_embeddings')
+        df_bpr_temp = concat_columns_to_tensor(df_bpr_temp, columns_to_concat_users, 'user_full_embeddings')
 
-                print(f"Testing model with use_bpr={'bpr' if use_bpr else 'binary'} and fusion_method={fusion_method}")
-                if fusion_method == 'by_autoencoder':
-                    print(f"Using autoencoder fusion method with encoding dimension {encoding_dims[-1]}")
-                    model = MultimodalModel(modality_dims, use_bpr=use_bpr, fusion_method=fusion_method,shared_dim=shared_dimensions, layers_per_modality=layers_per_modality ,autoencoders={'course': course_encoder, 'user': user_encoder}, autoencoder_output_dim=encoding_dims[-1])
-                else:
-                    print(f"Using concatenation fusion method")
-                    #Concat the encoding dim and the layers per modality in a single list
-                    new_layers_per_modality = encoding_dims + layers_per_modality
-                    model = MultimodalModel(modality_dims, use_bpr=use_bpr, fusion_method=fusion_method,shared_dim=shared_dimensions, layers_per_modality=new_layers_per_modality ,autoencoders=None, autoencoder_output_dim=None)
+        # Create tensors for courses and users
+        course_tensor = [torch.tensor(x, dtype=torch.float) for x in df_binary_temp['course_full_embeddings'].values]
+        embeddings_course_tensor = torch.stack(course_tensor)
 
-                if use_bpr:
-                    dataset = BPRDataset(df_bpr_temp)
-                    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-                    model_path = f'{saving_path}_multimodal_{fusion_method}_{reg_lambda}_bpr.pth'
-                else:
-                    dataset = BinaryDataset(df_binary_temp)
-                    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-                    model_path = f'{saving_path}_multimodal_{fusion_method}_binary.pth'
-                
-                model.train_model(
-                    train_loader=dataloader,
-                    epochs=epochs,
-                    lr=1e-3,
-                    device='cuda',
-                    save_path=model_path,
-                    reg_lambda=reg_lambda,
-                    verbose=False
-                )
+        user_tensor = [torch.tensor(x, dtype=torch.float) for x in df_binary_temp['user_full_embeddings'].values]
+        embeddings_user_tensor = torch.stack(user_tensor)
+        
+        # Define a unique saving path based on the columns used
+        saving_path = PATH_TO_CHECKPOINTS + '_'.join([col.split('_')[1] for col in columns_to_concat_users])
 
-                # Create a mapping of user_id to user_sequence_embedding from the train dataset
-                user_sequence_mapping = df_binary_temp.drop_duplicates(subset="user_id").set_index('user_id')['user_full_embeddings'].to_dict()
-                # Replace the user_sequence_embedding in the test dataset using the mapping
-                df_test_recommender['user_full_embeddings'] = df_test_recommender['user_id'].map(user_sequence_mapping)
+        course_encoder = train_autoencoder_and_extract_encoder(embeddings_course_tensor, embeddings_course_tensor.shape[1], encoding_dims, save_path=f'{saving_path}_encoder_course.pth' ,epochs=100, lr=1e-3, verbose=False)
 
-                course_sequence_mapping = df_bpr_temp.drop_duplicates(subset="pos_item_id").set_index('pos_item_id')['pos_course_full_embeddings'].to_dict()
-                
-                avg_mrr, avg_ndcg_at_k, avg_precision_at_k, avg_custom_precision_at_k = test_model(df_test_recommender, models=[model], courses_dict=course_sequence_mapping, k=k)
+        user_encoder = train_autoencoder_and_extract_encoder(embeddings_user_tensor, embeddings_user_tensor.shape[1], encoding_dims, save_path=f'{saving_path}_encoder_user.pth', epochs=100, lr=1e-3, verbose=False)
 
-                ## add the results
-                results.append({
-                    'model_path': model_path,
-                    'use_bpr': 'bpr' if use_bpr else 'binary',
-                    'fusion_method': fusion_method,
-                    'reg_lambda': reg_lambda,
-                    'avg_mrr': avg_mrr,
-                    'avg_ndcg_at_k': avg_ndcg_at_k,
-                    'avg_precision_at_k': avg_precision_at_k,
-                    'avg_custom_precision_at_k': avg_custom_precision_at_k
-                })
+        modality_dims = {
+            'course': embeddings_course_tensor.shape[1],
+            'user': embeddings_user_tensor.shape[1]
+        }
+
+        # Create combinations parameters for the multimodal model (with/without autoencoder fusion) method and with BPR or Binary loss then for each combination create the model and test it.   
+
+        combinations_user_bpr = [True, False]
+        combinations_fusion_method = ['concat', 'by_autoencoder']
+
+        for use_bpr in combinations_user_bpr:
+            for fusion_method in combinations_fusion_method:
+                temp_regularization_bpr_values = regularization_bpr_values if use_bpr else [0.0]
+                for reg_lambda in temp_regularization_bpr_values:
+                    print(f"Testing model with use_bpr={'bpr' if use_bpr else 'binary'} and fusion_method={fusion_method}")
+                    if fusion_method == 'by_autoencoder':
+                        print(f"Using autoencoder fusion method with encoding dimension {encoding_dims[-1]}")
+                        model = MultimodalModel(modality_dims, use_bpr=use_bpr, fusion_method=fusion_method,shared_dim=shared_dimensions, layers_per_modality=layers_per_modality ,autoencoders={'course': course_encoder, 'user': user_encoder}, autoencoder_output_dim=encoding_dims[-1])
+                    else:
+                        print(f"Using concatenation fusion method")
+                        #Concat the encoding dim and the layers per modality in a single list
+                        new_layers_per_modality = encoding_dims + layers_per_modality
+                        model = MultimodalModel(modality_dims, use_bpr=use_bpr, fusion_method=fusion_method,shared_dim=shared_dimensions, layers_per_modality=new_layers_per_modality ,autoencoders=None, autoencoder_output_dim=None)
+
+                    if use_bpr:
+                        dataset = BPRDataset(df_bpr_temp)
+                        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                        model_path = f'{saving_path}_multimodal_{fusion_method}_{reg_lambda}_bpr.pth'
+                    else:
+                        dataset = BinaryDataset(df_binary_temp)
+                        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                        model_path = f'{saving_path}_multimodal_{fusion_method}_binary.pth'
+                    
+                    model.train_model(
+                        train_loader=dataloader,
+                        epochs=epochs,
+                        lr=1e-3,
+                        device='cuda',
+                        save_path=model_path,
+                        reg_lambda=reg_lambda,
+                        verbose=False
+                    )
+
+                    # Create a mapping of user_id to user_sequence_embedding from the train dataset
+                    user_sequence_mapping = df_binary_temp.drop_duplicates(subset="user_id").set_index('user_id')['user_full_embeddings'].to_dict()
+                    # Replace the user_sequence_embedding in the test dataset using the mapping
+                    df_test_recommender['user_full_embeddings'] = df_test_recommender['user_id'].map(user_sequence_mapping)
+
+                    course_sequence_mapping = df_bpr_temp.drop_duplicates(subset="pos_item_id").set_index('pos_item_id')['pos_course_full_embeddings'].to_dict()
+                    
+                    avg_mrr, avg_ndcg_at_k, avg_precision_at_k, avg_custom_precision_at_k = test_model(df_test_recommender, models=[model], courses_dict=course_sequence_mapping, k=k)
+
+                    ## add the results
+                    results.append({
+                        'models_used': '_'.join([col.split('_')[1] for col in columns_to_concat_users]),
+                        'use_bpr': 'bpr' if use_bpr else 'binary',
+                        'fusion_method': fusion_method,
+                        'reg_lambda': reg_lambda,
+                        'avg_mrr': avg_mrr,
+                        'avg_ndcg_at_k': avg_ndcg_at_k,
+                        'avg_precision_at_k': avg_precision_at_k,
+                        'avg_custom_precision_at_k': avg_custom_precision_at_k
+                    })
+                    #update progress bar
+                    sys.stdout = sys.__stdout__
+                    pbar.update(1)
     #Save results in a pkl file as a list of dicts
     if pickle_results_path is not None:
         with open(pickle_results_path, 'wb') as f:
