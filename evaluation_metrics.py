@@ -33,7 +33,7 @@ def calculate_average_precision_at_k(true_items, predicted_items, k):
     """Calculates Average Precision at k."""
     total_ap = 0.0
     for true_item, predicted_list in zip(true_items, predicted_items):
-        total_ap += calculate_precision_at_k(true_item, predicted_list, k)
+        total_ap += calculate_precision_at_k(true_item, predicted_list[:k], k)
     return total_ap / len(true_items) if true_items else 0.0
 
 def calculate_average_custom_precision_at_k(true_items, predicted_items, k):
