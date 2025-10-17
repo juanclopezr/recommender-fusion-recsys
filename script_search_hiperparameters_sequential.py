@@ -51,13 +51,14 @@ course_encoder_path_saved = '/home/jcsanguino10/local_citation_model/data/proces
 # Load and concatenate datasets for preprocessing
 train_df = pd.read_csv(train_dataset)
 test_df = pd.read_csv(test_dataset)
-df = pd.concat([train_df, test_df])
-df.reset_index(drop=True, inplace=True)
+# df = pd.concat([train_df, test_df])
+# df.reset_index(drop=True, inplace=True)
+
+user_sequences_test = preprocess_data(test_df)
 
 # Sequence length distribution (after preprocessing)
-user_sequences = preprocess_data(df)
+user_sequences = preprocess_data(train_df)
 sequence_lengths = user_sequences.apply(len)
-
 
 # Model Configuration and Hyperparameters
 class Args:
@@ -216,19 +217,28 @@ def run_experiment(user_sequences, experiment_config):
     model_utils.load_pytorch_weights(trained_model, args.checkpoint_path, device=args.device)
     print("✅ Loaded best model weights from checkpoint.")
     
+
     # Create train and test sequences for evaluation
     test_recommender_sequences = {}
     train_recommender_sequences = {}
 
     for user_id, seq in dataloader_creator.encoded_sequences:
-        seq_length = len(seq)
-        train_length = int(seq_length * (1 - args.test_split))
-        train_recommender_sequences[user_id] = seq[:train_length]
-        test_recommender_sequences[user_id] = seq[train_length:]
+        train_recommender_sequences[user_id] = seq
+
+    # User course encoder to parse the test sequences
+    for user_id, seq in user_sequences_test.items():
+        # Encode using the course encoder, ignoring unknown courses
+        encoded_seq = [course_encoder.transform([course])[0] for course in seq if course in course_encoder.classes_]
+        test_recommender_sequences[user_id] = encoded_seq
 
     # Create pandas series from the dictionaries
     recommender_user_sequences = pd.Series(train_recommender_sequences)
     test_recommender_sequences = pd.Series(test_recommender_sequences)
+
+    # print heads of sequences
+    print(f"Sample training sequences:\n{recommender_user_sequences.shape}")
+    print(f"Sample test sequences:\n{test_recommender_sequences.shape}")
+
 
     # Generate recommendations based on model type
     if args.sequential_model == 'BERT4Rec':
@@ -275,12 +285,14 @@ def run_experiment(user_sequences, experiment_config):
         print("Warning: No valid evaluation data")
         return 0.0, 0.0, 0.0, 0.0, len(train_loader), len(val_loader)
 
-def run_all_experiments(hyperparameter_combinations, user_sequences, results_filepath="grid_search_results_pytorch.csv"):
+def run_all_experiments(hyperparameter_combinations, user_sequences, results_filepath="grid_search_results_pytorch.csv", verbose=False):
     """Run all experiments for all combinations of hyperparameters and save the results in a CSV file"""
     results = []
 
     for i, experiment_config in enumerate(tqdm(hyperparameter_combinations, desc="Running experiments")):      
-        print(f"\n=== Experiment {i+1}/{len(hyperparameter_combinations)} ===")   
+        print(f"\n=== Experiment {i+1}/{len(hyperparameter_combinations)} ===")  
+        if not verbose: 
+            sys.stdout = open(os.devnull, 'w')
         try:
             # Run the experiment
             mrr, precision_at_5, ndcg_at_5, custom_precision_at_5, train_samples, val_samples = run_experiment(
@@ -324,6 +336,8 @@ def run_all_experiments(hyperparameter_combinations, user_sequences, results_fil
             })
             pd.DataFrame(results).to_csv(results_filepath, index=False)
             continue
+        if not verbose:
+            sys.stdout = sys.__stdout__
 
     # Save final results to CSV
     pd.DataFrame(results).to_csv(results_filepath, index=False)
@@ -338,7 +352,7 @@ if __name__ == "__main__":
     # Run experiments for all hyperparameter combinations
     path_dataset = '/home/jcsanguino10/local_citation_model/data/sequential_recommender_results.csv'
 
-    results = run_all_experiments(hyperparameter_combinations, user_sequences, results_filepath=path_dataset)
+    results = run_all_experiments(hyperparameter_combinations, user_sequences, results_filepath=path_dataset, verbose=False)
     
     # Display summary of results
     print("\n=== Grid Search Summary ===")

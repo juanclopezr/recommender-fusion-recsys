@@ -295,7 +295,8 @@ def test_multimodal_model(columns_combinations, encoding_dims, shared_dimensions
                         'avg_custom_precision_at_k': avg_custom_precision_at_k
                     })
                     #update progress bar
-                    sys.stdout = sys.__stdout__
+                    if not verbose:
+                        sys.stdout = sys.__stdout__
                     pbar.update(1)
     #Save results in a pkl file as a list of dicts
     if pickle_results_path is not None:
